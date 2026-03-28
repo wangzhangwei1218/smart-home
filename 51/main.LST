@@ -1,0 +1,254 @@
+C51 COMPILER V9.56.0.0   MAIN                                                              03/24/2026 15:35:00 PAGE 1   
+
+
+C51 COMPILER V9.56.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN main.OBJ
+COMPILER INVOKED BY: D:\Program Files\keil5\C51\BIN\C51.EXE main.c OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND TABS(2)
+
+line level    source
+
+   1          #include <reg52.h>
+   2          #include <intrins.h>
+   3          #include <math.h>
+   4          
+   5          #define uchar unsigned char
+   6          #define uint  unsigned int
+   7          #define ulong unsigned long
+   8          
+   9          #include "1602.h"      // LCD1602驱动
+  10          #include "ad.h"        // ADC0832驱动
+  11          #include "DS18B20.h"   // 温度传感器驱动
+  12          #include "autor.h"     // 电机驱动
+  13          
+  14          uchar code zifu0[] = "Humi:00.0%RH "; 
+  15          uchar code zifu1[] = "Temp:00.0C Le:00"; 
+  16          
+  17          char TH = 26, TL = 23; // 上下限阈值
+  18          int ans1;              
+  19          uchar flag;            
+  20          
+  21          sbit out = P3^6; // 继电器
+  22          sbit buz = P3^7; // 蜂鸣器
+  23          
+  24          ulong u2 = 0;    // 湿度值
+  25          ulong i2 = 0;    // 光照值
+  26          
+  27          uchar curtainState = 0;         // 0:关, 1:开
+  28          #define L_OPEN         8        // 开窗阈值
+  29          #define L_CLOSE        5        // 关窗阈值
+  30          #define CURTAIN_STEPS  40       // 电机步数
+  31          
+  32          uchar rxBuf[20];      
+  33          uchar rxIdx = 0;      
+  34          uchar rxFlag = 0;     
+  35          uint  sendTick = 0;   
+  36          uchar manualMode = 0; // 0:自动, 1:APP手动
+  37          
+  38          // 串口初始化
+  39          void UartInit(void) {
+  40   1          SCON = 0x50;  
+  41   1          TMOD &= 0x0F; 
+  42   1          TMOD |= 0x20; 
+  43   1          TH1 = 0xFD;   
+  44   1          TL1 = 0xFD;
+  45   1          TR1 = 1;      
+  46   1          ES  = 1;      
+  47   1          EA  = 1;      
+  48   1      }
+  49          
+  50          // 发送字符
+  51          void UartSendChar(uchar c) {
+  52   1          uint timeout = 0;
+  53   1          SBUF = c;
+  54   1          while (!TI && ++timeout < 10000); 
+  55   1          TI = 0;
+C51 COMPILER V9.56.0.0   MAIN                                                              03/24/2026 15:35:00 PAGE 2   
+
+  56   1      }
+  57          
+  58          // 发送字符串
+  59          void UartSendString(uchar *str) {
+  60   1          while (*str) UartSendChar(*str++);
+  61   1      }
+  62          
+  63          // 发送数字
+  64          void UartSendNum(int num) {
+  65   1          uchar buf[6];
+  66   1          uchar i = 0;
+  67   1          if (num == 0) { UartSendChar('0'); return; }
+  68   1          if (num < 0)  { UartSendChar('-'); num = -num; }
+  69   1          while (num > 0) {
+  70   2              buf[i++] = (num % 10) + '0';
+  71   2              num /= 10;
+  72   2          }
+  73   1          while (i > 0) {
+  74   2              UartSendChar(buf[--i]);
+  75   2          }
+  76   1      }
+  77          
+  78          // 串口中断
+  79          void Uart_Isr() interrupt 4 {
+  80   1          if (RI) {
+  81   2              uchar c = SBUF;
+  82   2              RI = 0;
+  83   2              if (rxFlag == 1) return; 
+  84   2              if (c == '\n' || c == '\r') {
+  85   3                  if (rxIdx > 0) {
+  86   4                      rxBuf[rxIdx] = '\0';
+  87   4                      rxFlag = 1; 
+  88   4                  }
+  89   3              } else {
+  90   3                  rxBuf[rxIdx++] = c;
+  91   3                  if (rxIdx >= 20) rxIdx = 0; 
+  92   3              }
+  93   2          }
+  94   1      }
+  95          
+  96          // 解析数字
+  97          int GetNumFromStr(uchar *str) {
+  98   1          int res = 0;
+  99   1          uchar sign = 1;
+ 100   1          if (*str == '-') { sign = -1; str++; }
+ 101   1          while (*str >= '0' && *str <= '9') {
+ 102   2              res = res * 10 + (*str - '0');
+ 103   2              str++;
+ 104   2          }
+ 105   1          return res * sign;
+ 106   1      }
+ 107          
+ 108          void delay1(uchar x) {
+ 109   1          uchar i, j, k;
+ 110   1          for(k=x; k>0; k--)
+ 111   1              for(i=20; i>0; i--)
+ 112   1                  for(j=248; j>0; j--);
+ 113   1      }
+ 114          
+ 115          void BeepOnce(void) {
+ 116   1          buz = 0; delay1(10);
+ 117   1          buz = 1; delay1(10);
+C51 COMPILER V9.56.0.0   MAIN                                                              03/24/2026 15:35:00 PAGE 3   
+
+ 118   1      }
+ 119          
+ 120          // 刷新LCD显示
+ 121          void xianshi(void) {
+ 122   1          u2 = adc08322(0) * (ulong)300 / (ulong)255; 
+ 123   1          i2 = adc08322(1) * (ulong)15  / (ulong)255; 
+ 124   1      
+ 125   1          lcd1602_adr(0x05);
+ 126   1          lcd1602_writenumber(0x30 + u2%1000/100);
+ 127   1          lcd1602_writenumber(0x30 + u2%100/10);
+ 128   1          lcd1602_writenumber('.');
+ 129   1          lcd1602_writenumber(0x30 + u2%10);
+ 130   1      
+ 131   1          lcd1602_adr(0x45);
+ 132   1          lcd1602_writenumber(0x30 + ans1%100/10);
+ 133   1          lcd1602_writenumber(0x30 + ans1%10);
+ 134   1          lcd1602_writenumber('.');
+ 135   1          lcd1602_writenumber(0x30 + 0);
+ 136   1      
+ 137   1          lcd1602_adr(0x4e);
+ 138   1          lcd1602_writenumber(0x30 + i2%100/10);
+ 139   1          lcd1602_writenumber(0x30 + i2%10);
+ 140   1      }
+ 141          
+ 142          void Curtain_Open(void) {
+ 143   1          uchar n;
+ 144   1          for(n=0; n<CURTAIN_STEPS; n++) MotorRight();
+ 145   1          curtainState = 1;
+ 146   1      }
+ 147          
+ 148          void Curtain_Close(void) {
+ 149   1          uchar n;
+ 150   1          for(n=0; n<CURTAIN_STEPS; n++) MotorLeft(50);
+ 151   1          curtainState = 0;
+ 152   1      }
+ 153          
+ 154          void main(void) {
+ 155   1          lcd1602_init();
+ 156   1          UartInit(); 
+ 157   1      
+ 158   1          LCD1602_string(1,1,zifu0);
+ 159   1          LCD1602_string(2,1,zifu1);
+ 160   1      
+ 161   1          buz = 1;  
+ 162   1          out = 1;  
+ 163   1          curtainState = 1; 
+ 164   1      
+ 165   1          while(1) {
+ 166   2              xianshi(); 
+ 167   2              DS18B20_start_change1();
+ 168   2              ans1 = DS18B20_read_date1();
+ 169   2      
+ 170   2              // 1. 串口指令解析
+ 171   2              if (rxFlag) {
+ 172   3                  if (rxBuf[0]=='O' && rxBuf[1]=='U' && rxBuf[2]=='T' && rxBuf[3]==':') {
+ 173   4                      manualMode = 1; 
+ 174   4                      if (rxBuf[4] == '1') {
+ 175   5                          out = 1; 
+ 176   5                          if (curtainState == 0) Curtain_Open(); 
+ 177   5                      } 
+ 178   4                      else {
+ 179   5                          out = 0; 
+C51 COMPILER V9.56.0.0   MAIN                                                              03/24/2026 15:35:00 PAGE 4   
+
+ 180   5                          if (curtainState == 1) Curtain_Close(); 
+ 181   5                      }
+ 182   4                      BeepOnce(); 
+ 183   4                  }
+ 184   3                  else if (rxBuf[0]=='S' && rxBuf[1]=='E' && rxBuf[2]=='T' && rxBuf[3]=='T' && rxBuf[4]=='H' && 
+             -rxBuf[5]==':') {
+ 185   4                      TH = GetNumFromStr(&rxBuf[6]);
+ 186   4                      manualMode = 0; 
+ 187   4                      BeepOnce();
+ 188   4                  }
+ 189   3                  else if (rxBuf[0]=='S' && rxBuf[1]=='E' && rxBuf[2]=='T' && rxBuf[3]=='T' && rxBuf[4]=='L' && 
+             -rxBuf[5]==':') {
+ 190   4                      TL = GetNumFromStr(&rxBuf[6]);
+ 191   4                      manualMode = 0; 
+ 192   4                      BeepOnce();
+ 193   4                  }
+ 194   3                  rxIdx = 0;
+ 195   3                  rxFlag = 0; 
+ 196   3              }
+ 197   2      
+ 198   2              // 2. 自动控制模式
+ 199   2              if (manualMode == 0) { 
+ 200   3                  if((i2 >= L_OPEN) && (curtainState == 0)) {
+ 201   4                      Curtain_Open(); 
+ 202   4                      out = 1; 
+ 203   4                      BeepOnce();
+ 204   4                  }
+ 205   3                  else if((i2 <= L_CLOSE) && (curtainState == 1)) {
+ 206   4                      Curtain_Close(); 
+ 207   4                      out = 0; 
+ 208   4                      BeepOnce();
+ 209   4                  }
+ 210   3              }
+ 211   2      
+ 212   2              // 3. 上报数据
+ 213   2              sendTick++;
+ 214   2              if(sendTick > 25) {
+ 215   3                  sendTick = 0;
+ 216   3                  UartSendString("T:"); UartSendNum(ans1); UartSendString(".0");
+ 217   3                  UartSendString(",H:"); UartSendNum((int)(u2/10)); UartSendChar('.'); UartSendChar((uchar)('0'+
+             -(u2%10)));
+ 218   3                  UartSendString(",L:"); UartSendNum(i2);
+ 219   3                  UartSendString("\r\n");
+ 220   3              }
+ 221   2          }
+ 222   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1403    ----
+   CONSTANT SIZE    =     48    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     45      19
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
